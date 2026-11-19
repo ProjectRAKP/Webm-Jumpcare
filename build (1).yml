@@ -1,0 +1,476 @@
+# Rbx Uploader - build otomatis di GitHub Actions.
+# File ini membuat seluruh proyek Android (kode ada di bawah, bisa dibaca),
+# lalu membuild APK. Hasilnya ada di tab Actions > run terbaru > Artifacts.
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Buat proyek dari kode di bawah
+        run: |
+          set -e
+          cat > "settings.gradle.kts" <<'RBX_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "RbxUploader"
+          include(":app")
+          RBX_EOF
+          cat > "build.gradle.kts" <<'RBX_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          RBX_EOF
+          cat > "gradle.properties" <<'RBX_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          RBX_EOF
+          mkdir -p "app"
+          cat > "app/build.gradle.kts" <<'RBX_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "app.rbxuploader"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "app.rbxuploader"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          RBX_EOF
+          mkdir -p "app/src/main"
+          cat > "app/src/main/AndroidManifest.xml" <<'RBX_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Satu-satunya izin: internet, untuk memanggil API Roblox. -->
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="Rbx Uploader"
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          RBX_EOF
+          mkdir -p "app/src/main/java/app/rbxuploader"
+          cat > "app/src/main/java/app/rbxuploader/SecureStore.kt" <<'RBX_EOF'
+          package app.rbxuploader
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import java.security.KeyStore
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+
+          /**
+           * Penyimpanan kecil terenkripsi (AES-256-GCM) memakai Android Keystore.
+           * Kunci enkripsi tersimpan di chip/keystore perangkat dan tidak bisa diekspor.
+           */
+          object SecureStore {
+              private const val ALIAS = "rbx_uploader_key"
+              private const val PREFS = "secure_prefs"
+              private const val IV_SIZE = 12
+
+              private fun secretKey(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore")
+                  ks.load(null)
+                  val existing = ks.getKey(ALIAS, null)
+                  if (existing is SecretKey) return existing
+
+                  val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                  val spec = KeyGenParameterSpec.Builder(
+                      ALIAS,
+                      KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                  )
+                      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                      .setKeySize(256)
+                      .build()
+                  gen.init(spec)
+                  return gen.generateKey()
+              }
+
+              fun save(context: Context, name: String, value: String) {
+                  val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                  cipher.init(Cipher.ENCRYPT_MODE, secretKey())
+                  val encrypted = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+                  val blob = Base64.encodeToString(cipher.iv + encrypted, Base64.NO_WRAP)
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .edit().putString(name, blob).apply()
+              }
+
+              fun load(context: Context, name: String): String? {
+                  val blob = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .getString(name, null) ?: return null
+                  return try {
+                      val raw = Base64.decode(blob, Base64.NO_WRAP)
+                      val iv = raw.copyOfRange(0, IV_SIZE)
+                      val data = raw.copyOfRange(IV_SIZE, raw.size)
+                      val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                      cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(128, iv))
+                      String(cipher.doFinal(data), Charsets.UTF_8)
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              fun clear(context: Context, name: String) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .edit().remove(name).apply()
+              }
+          }
+          RBX_EOF
+          mkdir -p "app/src/main/java/app/rbxuploader"
+          cat > "app/src/main/java/app/rbxuploader/MainActivity.kt" <<'RBX_EOF'
+          package app.rbxuploader
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.OpenableColumns
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /**
+           * Rbx Uploader: unggah file place (.rbxl / .rbxlx) ke Roblox lewat
+           * Open Cloud Place Publishing API. Tanpa cookie, tanpa password.
+           * Data hanya dikirim ke https://apis.roblox.com
+           */
+          class MainActivity : Activity() {
+
+              private val pickRequest = 1001
+              private val keyName = "apikey"
+
+              private var fileUri: Uri? = null
+              private var fileSize: Long = -1L
+              private var fileName: String = ""
+
+              private lateinit var fileLabel: TextView
+              private lateinit var apiKeyInput: EditText
+              private lateinit var universeInput: EditText
+              private lateinit var placeInput: EditText
+              private lateinit var rememberBox: CheckBox
+              private lateinit var publishBox: CheckBox
+              private lateinit var uploadBtn: Button
+              private lateinit var statusView: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  title = "Rbx Uploader"
+
+                  val pad = dp(16)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
+
+                  val intro = TextView(this)
+                  intro.text = "Unggah file place (.rbxl / .rbxlx) ke Roblox lewat Open Cloud. " +
+                      "Tidak memakai cookie atau password."
+                  root.addView(intro)
+
+                  val pickBtn = Button(this)
+                  pickBtn.text = "Pilih file place"
+                  pickBtn.setOnClickListener { pickFile() }
+                  root.addView(pickBtn)
+
+                  fileLabel = TextView(this)
+                  fileLabel.text = "Belum ada file dipilih"
+                  root.addView(fileLabel)
+
+                  root.addView(label("API key (izin: universe-places, Write)"))
+                  apiKeyInput = EditText(this)
+                  apiKeyInput.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  apiKeyInput.hint = "API key"
+                  apiKeyInput.setSingleLine(true)
+                  root.addView(apiKeyInput)
+
+                  root.addView(label("Universe ID"))
+                  universeInput = EditText(this)
+                  universeInput.inputType = InputType.TYPE_CLASS_NUMBER
+                  universeInput.hint = "contoh: 123456789"
+                  root.addView(universeInput)
+
+                  root.addView(label("Place ID"))
+                  placeInput = EditText(this)
+                  placeInput.inputType = InputType.TYPE_CLASS_NUMBER
+                  placeInput.hint = "contoh: 987654321"
+                  root.addView(placeInput)
+
+                  rememberBox = CheckBox(this)
+                  rememberBox.text = "Ingat API key di HP ini (terenkripsi)"
+                  root.addView(rememberBox)
+
+                  publishBox = CheckBox(this)
+                  publishBox.text = "Publish langsung (jika tidak dicentang: hanya Save)"
+                  root.addView(publishBox)
+
+                  uploadBtn = Button(this)
+                  uploadBtn.text = "Upload ke Roblox"
+                  uploadBtn.setOnClickListener { upload() }
+                  root.addView(uploadBtn)
+
+                  statusView = TextView(this)
+                  statusView.setPadding(0, dp(12), 0, 0)
+                  statusView.setTextIsSelectable(true)
+                  root.addView(statusView)
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+
+                  // Pulihkan data yang tersimpan
+                  val prefs = getSharedPreferences("ids", Context.MODE_PRIVATE)
+                  universeInput.setText(prefs.getString("universe", ""))
+                  placeInput.setText(prefs.getString("place", ""))
+                  val savedKey = SecureStore.load(this, keyName)
+                  if (savedKey != null) {
+                      apiKeyInput.setText(savedKey)
+                      rememberBox.isChecked = true
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(text: String): TextView {
+                  val t = TextView(this)
+                  t.text = text
+                  t.setPadding(0, dp(12), 0, dp(2))
+                  return t
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+              }
+
+              private fun pickFile() {
+                  val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  intent.addCategory(Intent.CATEGORY_OPENABLE)
+                  intent.type = "*/*"
+                  startActivityForResult(intent, pickRequest)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != pickRequest || resultCode != Activity.RESULT_OK) return
+                  val uri = data?.data ?: return
+
+                  var name = "file"
+                  var size = -1L
+                  val cursor = contentResolver.query(uri, null, null, null, null)
+                  if (cursor != null) {
+                      cursor.use { c ->
+                          if (c.moveToFirst()) {
+                              val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                              val si = c.getColumnIndex(OpenableColumns.SIZE)
+                              if (ni >= 0 && !c.isNull(ni)) name = c.getString(ni)
+                              if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+                          }
+                      }
+                  }
+
+                  fileUri = uri
+                  fileName = name
+                  fileSize = size
+
+                  val sizeText = if (size >= 0) String.format("%.1f MB", size / 1048576.0) else "ukuran tidak diketahui"
+                  val ok = isPlaceFile(name)
+                  fileLabel.text = if (ok) {
+                      "File: $name ($sizeText)"
+                  } else {
+                      "File: $name ($sizeText)\nPeringatan: hanya .rbxl dan .rbxlx yang didukung (model .rbxm belum)."
+                  }
+              }
+
+              private fun isPlaceFile(name: String): Boolean {
+                  val n = name.lowercase()
+                  return n.endsWith(".rbxl") || n.endsWith(".rbxlx")
+              }
+
+              private fun upload() {
+                  val uri = fileUri
+                  if (uri == null) {
+                      toast("Pilih file dulu")
+                      return
+                  }
+                  if (!isPlaceFile(fileName)) {
+                      toast("Hanya file .rbxl atau .rbxlx")
+                      return
+                  }
+                  val key = apiKeyInput.text.toString().trim()
+                  val universe = universeInput.text.toString().trim()
+                  val place = placeInput.text.toString().trim()
+                  if (key.isEmpty()) {
+                      toast("Isi API key")
+                      return
+                  }
+                  val digits = Regex("^[0-9]+$")
+                  if (!digits.matches(universe) || !digits.matches(place)) {
+                      toast("Universe ID dan Place ID harus berupa angka")
+                      return
+                  }
+
+                  val versionType = if (publishBox.isChecked) "Published" else "Saved"
+
+                  if (rememberBox.isChecked) {
+                      try {
+                          SecureStore.save(this, keyName, key)
+                      } catch (e: Exception) {
+                          toast("API key tidak bisa disimpan di HP ini")
+                      }
+                  } else {
+                      SecureStore.clear(this, keyName)
+                  }
+                  getSharedPreferences("ids", Context.MODE_PRIVATE).edit()
+                      .putString("universe", universe)
+                      .putString("place", place)
+                      .apply()
+
+                  uploadBtn.isEnabled = false
+                  statusView.text = "Mengunggah..."
+
+                  Thread {
+                      val result = try {
+                          doUpload(uri, key, universe, place, versionType)
+                      } catch (e: Exception) {
+                          "Gagal: " + e.javaClass.simpleName + ": " + (e.message ?: "")
+                      }
+                      runOnUiThread {
+                          statusView.text = result
+                          uploadBtn.isEnabled = true
+                      }
+                  }.start()
+              }
+
+              private fun doUpload(uri: Uri, key: String, universe: String, place: String, versionType: String): String {
+                  val url = URL("https://apis.roblox.com/universes/v1/$universe/places/$place/versions?versionType=$versionType")
+                  val conn = url.openConnection() as HttpURLConnection
+                  try {
+                      conn.requestMethod = "POST"
+                      conn.doOutput = true
+                      conn.connectTimeout = 20000
+                      conn.readTimeout = 180000
+                      conn.setRequestProperty("x-api-key", key)
+                      val contentType = if (fileName.lowercase().endsWith(".rbxlx")) "application/xml" else "application/octet-stream"
+                      conn.setRequestProperty("Content-Type", contentType)
+                      if (fileSize > 0) {
+                          conn.setFixedLengthStreamingMode(fileSize)
+                      } else {
+                          conn.setChunkedStreamingMode(0)
+                      }
+
+                      val input = contentResolver.openInputStream(uri) ?: return "Gagal membuka file."
+                      input.use { src ->
+                          conn.outputStream.use { out ->
+                              src.copyTo(out, 64 * 1024)
+                          }
+                      }
+
+                      val code = conn.responseCode
+                      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                      val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
+
+                      return when {
+                          code in 200..299 -> {
+                              val v = Regex("\"versionNumber\"\\s*:\\s*(\\d+)").find(body)?.groupValues?.get(1)
+                              val how = if (versionType == "Published") "dipublikasikan" else "disimpan"
+                              if (v != null) "Berhasil: versi #$v $how." else "Berhasil: $how."
+                          }
+                          code == 401 -> "401: API key tidak valid atau sudah dicabut."
+                          code == 403 -> "403: Izin ditolak. Pastikan API key punya izin universe-places (Write) untuk game ini, dan pengaturan IP key mengizinkan."
+                          code == 404 -> "404: Universe ID atau Place ID tidak ditemukan."
+                          code == 413 -> "413: File terlalu besar."
+                          code == 429 -> "429: Terlalu banyak permintaan. Tunggu sebentar lalu coba lagi."
+                          else -> "Error $code: " + body.take(300)
+                      }
+                  } finally {
+                      conn.disconnect()
+                  }
+              }
+          }
+          RBX_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Siapkan Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;34.0.0" > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RbxUploader-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
